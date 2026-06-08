@@ -4,6 +4,7 @@ import os
 import bmesh
 import time
 import pathlib
+import math
 from app.worker.tasks.mesh.create_tileset import get_location_and_rotation, run as create_tileset_run, get_transform
 import json
 
@@ -92,16 +93,41 @@ def merge_vertices(threshold=0.0001):
 
 # import mesh
 def import_mesh(filepath):
-
     extension = pathlib.Path(filepath).suffix
     if extension == '.ply':
-        bpy.ops.wm.ply_import(filepath=filepath , forward_axis='Y', up_axis='Z')
+        bpy.ops.wm.ply_import(filepath=filepath, forward_axis='Y', up_axis='Z')
     else:
-        bpy.ops.wm.obj_import(filepath=filepath , forward_axis='Y', up_axis='Z')
+        bpy.ops.wm.obj_import(filepath=filepath, forward_axis='Y', up_axis='Z')
 
     obj = bpy.context.object
 
     merge_vertices()
+
+    min_x = float('inf')
+    min_y = float('inf')
+    min_z = float('inf')
+    max_x = float('-inf')
+    max_y = float('-inf')
+    max_z = float('-inf')
+    for vertex in obj.data.vertices:
+        x = vertex.co[0]
+        y = vertex.co[1]
+        z = vertex.co[2]
+        min_x = x if x < min_x else min_x
+        min_y = y if y < min_y else min_y
+        min_z = z if z < min_z else min_z
+        max_x = x if x > max_x else max_x
+        max_y = y if y > max_y else max_y
+        max_z = z if z > max_z else max_z
+
+    center_x = (min_x + max_x) / 2
+    center_y = (min_y + max_y) / 2
+    center_z = (min_z + max_z) / 2
+
+    for vertex in obj.data.vertices:
+        vertex.co[0] -= center_x
+        vertex.co[1] -= center_y
+        vertex.co[2] -= center_z
 
     top = float('-inf')
     left = float('inf')
@@ -364,7 +390,12 @@ def split_tile(params):
         with open(filepath.replace('.glb', '.json'), 'w') as f:
             json.dump(tile_info, f)
 
-        tile.data.transform(location_and_rotation.get('rotation'))
+        rotation = location_and_rotation.get('rotation')
+        if rotation is not None:
+            from mathutils import Matrix
+            if not isinstance(rotation, Matrix):
+                rotation = Matrix(rotation)
+            tile.data.transform(rotation)
         tile.data.update()
 
         location = location_and_rotation.get('location')
@@ -435,6 +466,35 @@ def crop_mesh(input_file,bbox):
     clean_up()
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
+def lat_lon_to_web_mercator(lat, lon):
+    """Convert lat/lon to Web Mercator (EPSG:3857) meters."""
+    x = lon * 20037508.34 / 180.0
+    y = math.log(math.tan((90.0 + lat) * math.pi / 360.0)) * (20037508.34 / math.pi)
+    return x, y
+
+def compute_footprint_bounds(latitude, longitude, mesh_size_meters):
+    """
+    Compute the footprint bounding box in Web Mercator (EPSG:3857).
+    Assumes mesh is centered at (latitude, longitude) with size in meters.
+    Returns: [minx, miny, maxx, maxy] in EPSG:3857
+    """
+    # Mesh center in Web Mercator
+    center_x, center_y = lat_lon_to_web_mercator(latitude, longitude)
+    
+    # Half-size in meters (approximate - Web Mercator meters vary by latitude)
+    # At the equator, 1 degree ≈ 111.32 km
+    # We'll use a simple offset in meters
+    half_width = mesh_size_meters[0] / 2.0
+    half_height = mesh_size_meters[1] / 2.0
+    
+    minx = center_x - half_width
+    maxx = center_x + half_width
+    miny = center_y - half_height
+    maxy = center_y + half_height
+    
+    return (minx, miny, maxx, maxy)
+
+
 def run(params):
 
     input_file = params.get('input_file', '')
@@ -461,6 +521,31 @@ def run(params):
     bake_mat = create_bake_material()
 
     merged, info = import_mesh(input_file)
+    
+    # Compute footprint bounds in Web Mercator (EPSG:3857)
+    mesh_size = info.get('size', [0, 0, 0])
+    footprint_bounds = compute_footprint_bounds(latitude, longitude, mesh_size)
+    
+    meta = {
+        'size': info.get('size'),
+        'top': info.get('top'),
+        'left': info.get('left'),
+        'footprint_bounds_3857': {
+            'minx': footprint_bounds[0],
+            'miny': footprint_bounds[1],
+            'maxx': footprint_bounds[2],
+            'maxy': footprint_bounds[3],
+            'description': 'Bounding box in EPSG:3857 (Web Mercator) meters'
+        },
+        'mesh_location': {
+            'latitude': latitude,
+            'longitude': longitude,
+            'altitude': altitude
+        }
+    }
+    
+    with open(os.path.join(output_dir, '_mesh_tileset_meta.json'), 'w') as f:
+        json.dump(meta, f)
     merged.hide_render = True
 
     merged.select_set(True)
@@ -582,27 +667,19 @@ def run(params):
 
         remove_obj(cloned_merged)
 
-    remove_obj(merged)
-    remove_obj(target_model)
-
-    clean_up()
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-
-    if create_tileset_json:
-
-        config = {
-            **info,
-            "depth": depth,
-            'output_dir': output_dir,
-            'max_geometric_error': max_geometric_error
-        }
-
-        tileset = create_tileset_run(config)
-
-        with open(os.path.join(output_dir, 'tileset.json'), 'w') as f:
-            json.dump(tileset, f)
-
-        return tileset
+    # Refresh metadata after tiling (size/bounds from root mesh).
+    with open(os.path.join(output_dir, '_mesh_tileset_meta.json'), 'w') as f:
+        json.dump(
+            {
+                'size': info.get('size'),
+                'top': info.get('top'),
+                'left': info.get('left'),
+                'depth': depth,
+                'max_geometric_error': max_geometric_error,
+            },
+            f,
+        )
 
     elapsed_time = (time.time() - start_time)
     logger.info(f"tiling completed in {elapsed_time} seconds")
+    return info

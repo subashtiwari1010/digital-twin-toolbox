@@ -1,9 +1,11 @@
+import json
 import os
 import shutil
+import subprocess
+import sys
 
 from app.worker.main import celery, PipelineDatabaseTask, AssetDatabaseTask
 from app.worker.common.utils import get_asset_upload_path, setup_output_directory
-import app.worker.tasks.mesh.mesh_tiling as mesh_tiling
 
 
 @celery.task(name="inspect_glb", base=AssetDatabaseTask)
@@ -15,19 +17,59 @@ def inspect_glb(options):
     }
 
 
+# Skip full Blender import during inspection for very large OBJ files (extracted size).
+_INSPECT_BLENDER_MAX_BYTES = 50 * 1024 * 1024
+
+
 @celery.task(name="inspect_mesh", base=AssetDatabaseTask)
 def inspect_mesh(options):
+    from app.worker.tasks.mesh.utils import (
+        estimate_mesh_size_from_obj,
+        resolve_mesh_input_file,
+    )
+
+    asset = options['asset']
+    asset_id = asset['id']
+    extension = asset['extension']
+
+    input_file = resolve_mesh_input_file(asset_id, extension)
+    if not os.path.isfile(input_file):
+        raise FileNotFoundError(f"Mesh file not found: {input_file}")
+
+    obj_size_bytes = os.path.getsize(input_file)
+    blender_verified = False
+    mesh_size = None
+    if input_file.lower().endswith(".obj"):
+        mesh_size = estimate_mesh_size_from_obj(input_file)
+
+    if obj_size_bytes <= _INSPECT_BLENDER_MAX_BYTES:
+        import app.worker.tasks.mesh.mesh_tiling as mesh_tiling
+
+        mesh_tiling.clean_up()
+        merged, info = mesh_tiling.import_mesh(input_file)
+        mesh_size = info.get('size') or mesh_size
+        mesh_tiling.remove_obj(merged)
+        mesh_tiling.clean_up()
+        blender_verified = True
+
+    payload = {
+        'metadata': False,
+        'stats': False,
+        'sample': False,
+        'epsg': None,
+        'horizontal_epsg': None,
+        'vertical_epsg': None,
+        'obj_path': input_file,
+        'obj_size_bytes': obj_size_bytes,
+        'blender_verified': blender_verified,
+    }
+    if mesh_size:
+        payload['size'] = mesh_size
+
     return {
         'asset_type': 'Mesh',
         'geometry_type': None,
-        'payload': {
-            'metadata': False,
-            'stats': False,
-            'sample': False,
-            'epsg': None,
-            'horizontal_epsg': None,
-            'vertical_epsg': None,
-        }
+        'payload': payload,
     }
 
 
@@ -53,13 +95,17 @@ def create_mesh_3dtiles(pipeline_extended):
 
     config = {**default_config, **pipeline_config}
 
-    input_file = get_asset_upload_path(f"{asset_id}/index{asset_extension}")
+    from app.worker.tasks.mesh.utils import resolve_mesh_input_file
+
+    input_file = resolve_mesh_input_file(asset_id, asset_extension)
     output_paths = setup_output_directory(pipeline_id)
     os.makedirs(output_paths['output_path_3dtiles'], exist_ok=True)
 
-    mesh_tiling.run({
+    tiles_dir = output_paths['output_path_3dtiles']
+
+    tiling_params = {
         'input_file': input_file,
-        'output_dir': output_paths['output_path_3dtiles'],
+        'output_dir': tiles_dir,
         'latitude': config['latitude'],
         'longitude': config['longitude'],
         'altitude': config['altitude'],
@@ -69,13 +115,26 @@ def create_mesh_3dtiles(pipeline_extended):
         'max_geometric_error': config['max_geometric_error'],
         'apply_transform': True,
         'decimate_last_depth_level': config['decimate_last_depth_level'],
-        'create_tileset_json': True,
+        'create_tileset_json': False,
         'start_x': 0,
         'start_y': 0,
         'start_z': 0,
-    })
+    }
 
-    shutil.make_archive(output_paths['output_path_3dtiles_zip'], 'zip', output_paths['output_path_3dtiles'])
+    subprocess.run(
+        [sys.executable, '-m', 'app.worker.tasks.mesh.run_tiling', json.dumps(tiling_params)],
+        check=True,
+    )
+
+    from app.worker.tasks.mesh.finalize import finalize_mesh_3dtiles_output
+
+    finalize_mesh_3dtiles_output(
+        tiles_dir,
+        config['depth'],
+        config['max_geometric_error'],
+    )
+
+    shutil.make_archive(output_paths['output_path_3dtiles_zip'], 'zip', tiles_dir)
 
     return {
         'output': output_paths['output_path'],

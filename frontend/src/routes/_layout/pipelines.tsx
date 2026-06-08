@@ -326,7 +326,7 @@ const SelectAssets = React.forwardRef((props: any, ref) => {
       AssetsService.readAssets({
         skip: 0,
         limit: 9999,
-        extension: ".shp.zip,.las,.laz,.phg.zip",
+        extension: ".shp.zip,.las,.laz,.phg.zip,.obj,.ply,.obj.zip",
         uploadStatus: "SUCCESS",
       }),
     queryKey: ["assets-select"],

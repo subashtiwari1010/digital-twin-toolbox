@@ -1,7 +1,6 @@
 import math
 import numpy as np
 from pyproj import Transformer
-from mathutils import Matrix
 import os
 import json
 
@@ -52,12 +51,12 @@ def get_location_and_rotation(params):
 
     return {
         'location': [x, y, z],
-        'rotation': Matrix((
-            (xr, xe, xs, 0),
-            (yr, ye, ys, 0),
-            (zr, ze, zs, 0),
-            (0, 0, 0, 1)
-        ))
+        'rotation': [
+            [xr, xe, xs, 0],
+            [yr, ye, ys, 0],
+            [zr, ze, zs, 0],
+            [0, 0, 0, 1],
+        ],
     }
 
 def get_transform(params):
@@ -173,6 +172,8 @@ def to_box(info):
 def run(config):
 
     size = config.get('size')
+    if not size:
+        raise ValueError('tileset config requires mesh "size" [width, depth, height] from tiling metadata')
     depth = config.get('depth')
     output_dir = config.get('output_dir')
 
@@ -276,4 +277,11 @@ def run(config):
             'uri': '0_0_0.glb'
         })
     }
+    
+    # Add footprint bounds and mesh location if available
+    if 'footprint_bounds_3857' in config:
+        tileset['footprint'] = config['footprint_bounds_3857']
+    if 'mesh_location' in config:
+        tileset['mesh_location'] = config['mesh_location']
+    
     return tileset
